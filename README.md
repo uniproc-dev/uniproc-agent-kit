@@ -9,14 +9,15 @@ Nothing here knows about an OS, a schema or a transport.
 |---|---|
 | `tag` | `Tagged<T>` and `Epoch` for conditional reads (`ifNoneMatch` → not modified), `Versioned<T>` that moves its tag only when the value moves. |
 | `latest` | `Latest<T>`: the value a collector published last, as `Tagged<Arc<T>>`, or why its last attempt failed; cheap to clone for readers. |
-| `monitor` | `Monitor`: a collector on a thread of its own that reports on every wake-up, at least once a period and no more often than the spacing (`Cadence`, 1 s / 50 ms by default). The first report is in before `start` returns. |
+| `monitor` | `Monitor`: a collector on a thread of its own that reports on every wake-up, at least once a period and no more often than the spacing (`Cadence`, 1 s / 50 ms by default). The first report is in before `start` returns; a wake-up does not move the periodic reports, and `set_period` changes the period while it runs. |
+| `notify` | `Notify`: a generation counter any executor's futures can wait on, for long polls that answer when the next report is in. |
 | `runner` | `Runner<K>`: worker threads that run one job at a time per target; a second job for a busy target gets `Busy` at once, a panicking job cancels its answer and frees its target. |
 | `follow` | `Following` / `Board`: watches that stream a key's status and holds that keep a key followed for a while, and the board the thread that learns the statuses keeps. The agent brings the source (SCM notifications, systemd over D-Bus, ...). |
 
 ## Using it
 
 ```toml
-uniproc-agent-kit = { git = "https://github.com/uniproc-dev/uniproc-agent-kit", tag = "v0.1.1" }
+uniproc-agent-kit = { git = "https://github.com/uniproc-dev/uniproc-agent-kit", tag = "v0.1.2" }
 ```
 
 A monitor over any collector:

@@ -2,7 +2,7 @@
 //! something new, at least once a period, and hands every report over.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -30,7 +30,12 @@ impl Default for Cadence {
 /// Reports from a thread of its own. Stops the collector when dropped.
 pub struct Monitor {
     running: Arc<AtomicBool>,
+    period: Arc<AtomicU64>,
     thread: Option<JoinHandle<()>>,
+}
+
+fn nanos(period: Duration) -> u64 {
+    period.as_nanos().clamp(1, u64::MAX as u128) as u64
 }
 
 impl Monitor {
@@ -40,6 +45,7 @@ impl Monitor {
     /// Returns once the first report has been handed over, or with the
     /// error `start` gave. The collector wakes the thread for an early report
     /// by unparking it: `std::thread::current()` inside `start` is that thread.
+    /// An early report does not move the periodic ones: they stay a period apart.
     pub fn start<T, R>(
         name: &str,
         cadence: Cadence,
@@ -50,9 +56,11 @@ impl Monitor {
         T: FnMut() -> R,
     {
         let running = Arc::new(AtomicBool::new(true));
+        let period = Arc::new(AtomicU64::new(nanos(cadence.period)));
         let (started, outcome) = mpsc::sync_channel(1);
         let thread = std::thread::Builder::new().name(name.to_string()).spawn({
             let running = running.clone();
+            let period = period.clone();
             move || {
                 let mut tick = match start() {
                     Ok(tick) => tick,
@@ -65,14 +73,23 @@ impl Monitor {
                 let _ = started.send(Ok(()));
 
                 let mut last = Instant::now();
+                let mut periodic = last;
                 loop {
-                    std::thread::park_timeout(cadence.period);
+                    let due = periodic + Duration::from_nanos(period.load(Ordering::Relaxed));
+                    let now = Instant::now();
+                    if now < due {
+                        std::thread::park_timeout(due - now);
+                    }
                     if !running.load(Ordering::Relaxed) {
                         break;
                     }
                     let since = last.elapsed();
                     if since < cadence.spacing {
                         std::thread::sleep(cadence.spacing - since);
+                    }
+                    let now = Instant::now();
+                    if now >= periodic + Duration::from_nanos(period.load(Ordering::Relaxed)) {
+                        periodic = now;
                     }
                     publish(tick());
                     last = Instant::now();
@@ -86,6 +103,7 @@ impl Monitor {
         match outcome {
             Ok(()) => Ok(Self {
                 running,
+                period,
                 thread: Some(thread),
             }),
             Err(error) => {
@@ -100,6 +118,13 @@ impl Monitor {
         if let Some(thread) = &self.thread {
             thread.thread().unpark();
         }
+    }
+
+    /// Reports at least this often from now on; a shorter period than the
+    /// current one takes effect at once.
+    pub fn set_period(&self, period: Duration) {
+        self.period.store(nanos(period), Ordering::Relaxed);
+        self.wake();
     }
 }
 
@@ -187,11 +212,49 @@ mod tests {
     }
 
     #[test]
+    fn a_wake_does_not_push_the_next_periodic_report_back() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let monitor = Monitor::start(
+            "test-monitor",
+            Cadence {
+                period: Duration::from_millis(300),
+                spacing: Duration::from_millis(1),
+            },
+            || Ok(Instant::now),
+            move |at| {
+                let _ = tx.send(at);
+            },
+        )
+        .unwrap();
+        let first = rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        monitor.wake();
+        let woken = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let periodic = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(woken - first < Duration::from_millis(290), "{:?}", woken - first);
+        assert!(
+            periodic - first < Duration::from_millis(450),
+            "the periodic report came {:?} after the first",
+            periodic - first
+        );
+    }
+
+    #[test]
+    fn a_shorter_period_takes_effect_at_once() {
+        let (monitor, reports) = counting(slow());
+        assert_eq!(reports.recv().unwrap(), 1);
+        monitor.set_period(Duration::from_millis(20));
+        for expected in 2..=5 {
+            assert_eq!(reports.recv_timeout(Duration::from_secs(5)), Ok(expected));
+        }
+    }
+
+    #[test]
     fn a_start_that_fails_is_the_error_of_start() {
         let started = Monitor::start(
             "test-monitor",
             Cadence::default(),
-            || -> Result<fn() -> ()> { Err(anyhow!("no collector")) },
+            || -> Result<fn()> { Err(anyhow!("no collector")) },
             |_| {},
         );
         assert_eq!(started.err().unwrap().to_string(), "no collector");
