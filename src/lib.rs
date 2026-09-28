@@ -12,7 +12,7 @@ pub mod tag;
 
 pub use follow::{Board, Following, Hold, Watch, board};
 pub use latest::Latest;
-pub use monitor::{Collector, Monitor, Waker, Why};
+pub use monitor::{Collector, Monitor, Waker, Wakes, Why};
 pub use notify::Notify;
 pub use runner::{Busy, Runner};
 pub use tag::{Epoch, Tagged, Versioned};

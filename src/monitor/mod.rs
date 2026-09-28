@@ -5,6 +5,9 @@
 //! due. A wake ticks it sooner, but never sooner than `spacing` after the
 //! last tick ended, so a burst of wakes costs one tick.
 //!
+//! The wakes come first: [`channel`] gives the [`Waker`] a collector can be
+//! built with, and the [`Wakes`] its monitor then reads.
+//!
 //! The thread is a state machine. Wakes and the stop travel one channel,
 //! and every wait reads it, so a stop is seen wherever the thread waits;
 //! a tick in progress runs to its end first.
@@ -29,21 +32,26 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 
-use machine::State;
+use machine::{Inbox, State};
 pub use machine::{Waker, Why};
 
-/// What a [`Monitor`] runs on its thread.
+/// What a [`Monitor`] ticks on its thread.
 pub trait Collector {
-    /// Runs on the monitor's thread before the first tick; the error is the
-    /// error of [`Monitor::start`]. `waker` wakes this monitor from anywhere.
-    fn start(&mut self, waker: Waker) -> Result<()> {
-        let _ = waker;
-        Ok(())
-    }
-
     /// Collects and hands the result over; returns when the next tick is
     /// due unless a wake comes first.
     fn tick(&mut self, why: Why) -> Instant;
+}
+
+/// The wakes one [`Monitor`] reads; made by [`channel`].
+pub struct Wakes {
+    waker: Waker,
+    inbox: Inbox,
+}
+
+/// A waker and the wakes it sends, for a monitor that does not run yet.
+pub fn channel() -> (Waker, Wakes) {
+    let (waker, inbox) = machine::channel();
+    (waker.clone(), Wakes { waker, inbox })
 }
 
 /// Ticks a [`Collector`] on a thread of its own. Stops it when dropped.
@@ -54,20 +62,20 @@ pub struct Monitor {
 }
 
 impl Monitor {
-    /// Starts `collector` on a new thread named `name` and returns once its
-    /// first tick is over, or with the error its start gave.
-    pub fn start(name: &str, spacing: Duration, mut collector: impl Collector + Send + 'static) -> Result<Self> {
-        let (waker, inbox) = machine::channel();
+    /// Moves `collector` to a new thread named `name`, where it is ticked
+    /// by `wakes` and its own deadlines. Returns once the first tick is over.
+    pub fn start(
+        name: &str,
+        spacing: Duration,
+        wakes: Wakes,
+        mut collector: impl Collector + Send + 'static,
+    ) -> Result<Self> {
+        let Wakes { waker, inbox } = wakes;
         let failure = Arc::new(OnceLock::new());
         let (started, outcome) = mpsc::sync_channel(1);
         let thread = std::thread::Builder::new().name(name.to_string()).spawn({
-            let waker = waker.clone();
             let failure = failure.clone();
             move || {
-                if let Err(error) = collector.start(waker) {
-                    let _ = started.send(Err(error));
-                    return;
-                }
                 let mut tick = |why| collector.tick(why);
                 let mut state = machine::next_state(State::Ticking { why: Why::Due }, &inbox, spacing, &mut tick);
                 if let State::Failed(reason) = &state {
@@ -163,10 +171,14 @@ mod tests {
         }
     }
 
+    fn start(spacing: Duration, collector: impl Collector + Send + 'static) -> Result<Monitor> {
+        let (_, wakes) = channel();
+        Monitor::start("test-monitor", spacing, wakes, collector)
+    }
+
     fn counting(spacing: Duration, every: Duration) -> (Monitor, Receiver<(u32, Why)>) {
         let (ticks, rx) = crossbeam_channel::unbounded();
-        let monitor = Monitor::start(
-            "test-monitor",
+        let monitor = start(
             spacing,
             Counting {
                 ticks,
@@ -218,40 +230,43 @@ mod tests {
     }
 
     #[test]
-    fn a_waker_handed_to_the_collector_wakes_it_from_another_thread() {
-        struct Handing(Arc<Slot<Waker>>, Sender<Why>);
-        impl Collector for Handing {
-            fn start(&mut self, waker: Waker) -> Result<()> {
-                self.0.put(waker);
-                Ok(())
-            }
-            fn tick(&mut self, why: Why) -> Instant {
-                let _ = self.1.send(why);
-                Instant::now() + LONG
-            }
-        }
-        let slot = Slot::new();
-        let (tx, whys) = crossbeam_channel::unbounded();
-        let _monitor = Monitor::start("test-monitor", Duration::from_millis(1), Handing(slot.clone(), tx)).unwrap();
-        let waker = slot.take().unwrap();
-        let _ = whys.recv();
+    fn a_waker_made_before_the_monitor_wakes_it_from_another_thread() {
+        let (waker, wakes) = channel();
+        let (ticks, rx) = crossbeam_channel::unbounded();
+        let _monitor = Monitor::start(
+            "test-monitor",
+            Duration::from_millis(1),
+            wakes,
+            Counting {
+                ticks,
+                count: 0,
+                every: LONG,
+            },
+        )
+        .unwrap();
+        let _ = rx.recv();
         std::thread::spawn(move || waker.wake()).join().unwrap();
-        assert_eq!(whys.recv_timeout(WAIT), Ok(Why::Woken));
+        assert_eq!(rx.recv_timeout(WAIT), Ok((2, Why::Woken)));
     }
 
     #[test]
-    fn a_start_that_fails_is_the_error_of_start() {
-        struct Failing;
-        impl Collector for Failing {
-            fn start(&mut self, _: Waker) -> Result<()> {
-                Err(anyhow!("no collector"))
-            }
-            fn tick(&mut self, _: Why) -> Instant {
-                unreachable!()
-            }
-        }
-        let started = Monitor::start("test-monitor", LONG, Failing);
-        assert_eq!(started.err().unwrap().to_string(), "no collector");
+    fn a_wake_sent_before_the_monitor_starts_is_not_lost() {
+        let (waker, wakes) = channel();
+        waker.wake();
+        let (ticks, rx) = crossbeam_channel::unbounded();
+        let _monitor = Monitor::start(
+            "test-monitor",
+            Duration::from_millis(1),
+            wakes,
+            Counting {
+                ticks,
+                count: 0,
+                every: LONG,
+            },
+        )
+        .unwrap();
+        assert_eq!(rx.recv(), Ok((1, Why::Due)));
+        assert_eq!(rx.recv_timeout(WAIT), Ok((2, Why::Woken)));
     }
 
     struct Panicking {
@@ -270,13 +285,13 @@ mod tests {
 
     #[test]
     fn a_first_tick_that_panics_is_the_error_of_start() {
-        let started = Monitor::start("test-monitor", LONG, Panicking { after: 0 });
+        let started = start(LONG, Panicking { after: 0 });
         assert_eq!(started.err().unwrap().to_string(), "the first tick panicked: collector broke");
     }
 
     #[test]
     fn a_tick_that_panics_later_is_the_failure() {
-        let monitor = Monitor::start("test-monitor", Duration::from_millis(1), Panicking { after: 1 }).unwrap();
+        let monitor = start(Duration::from_millis(1), Panicking { after: 1 }).unwrap();
         let deadline = Instant::now() + WAIT;
         while monitor.failure().is_none() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
@@ -304,7 +319,7 @@ mod tests {
         }
         let slot = Slot::new();
         let (tx, done) = crossbeam_channel::unbounded();
-        let monitor = Monitor::start("test-monitor", Duration::from_millis(1), Owning(slot.clone(), tx)).unwrap();
+        let monitor = start(Duration::from_millis(1), Owning(slot.clone(), tx)).unwrap();
         let _ = done.recv();
         let waker = monitor.waker();
         slot.put(monitor);
