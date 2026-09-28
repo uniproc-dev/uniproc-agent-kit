@@ -1,6 +1,6 @@
 [package]
 name = "uniproc-agent-kit"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 description = "OS-agnostic building blocks shared by the uniproc Windows and Linux agents"
 repository = "https://github.com/uniproc-dev/uniproc-agent-kit"
